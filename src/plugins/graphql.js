@@ -1,28 +1,68 @@
 'use strict'
 
 const shimmer = require('shimmer')
+const platform = require('../platform')
 
-let defaultFieldResolver = null
-
-function createWrapExecute (tracer, config) {
+function createWrapExecute (tracer, config, defaultFieldResolver) {
   return function wrapExecute (execute) {
     return function executeWithTrace () {
       const args = normalizeArgs(arguments)
       const schema = args.schema
+      const contextValue = args.contextValue || {}
       const fieldResolver = args.fieldResolver || defaultFieldResolver
 
-      // console.log(args.document.definitions[0].selectionSet.selections)
-
       args.fieldResolver = wrapResolve(fieldResolver, tracer, config)
+      args.contextValue = contextValue
+
+      contextValue._datadog_spans = {}
+      contextValue._datadog_resolvers = []
 
       if (!schema._datadog_patched) {
         wrapFields(schema._queryType._fields, tracer, config, [])
         schema._datadog_patched = true
       }
 
-      return execute.call(this, args)
+      let result = execute.call(this, args)
+
+      if (result && typeof result.then === 'function') {
+        result = result
+          .then(value => {
+            // trace(tracer, config, contextValue._datadog_resolvers)
+
+            for (const key in contextValue._datadog_spans) {
+              contextValue._datadog_spans[key].span.finish(contextValue._datadog_spans[key].finishTime)
+            }
+
+            return value
+          })
+      } else {
+        for (const key in contextValue._datadog_spans) {
+          console.log(contextValue._datadog_spans[key])
+          contextValue._datadog_spans[key].span.finish(contextValue._datadog_spans[key].finishTime)
+        }
+        // trace(tracer, config, contextValue._datadog_resolvers)
+      }
+
+      return result
     }
   }
+}
+
+function trace (tracer, config, resolvers) {
+  resolvers.forEach(resolver => {
+    tracer.trace('graphql.query', span => {
+      span.addTags({
+        'service.name': config.service || (tracer._service && `${tracer._service}-graphql`) || 'graphql',
+        'resource.name': resolver.path.join('.')
+      })
+
+      span._startTime = resolver.startTime
+
+      addError(span, resolver.error)
+
+      span.finish(resolver.duration)
+    })
+  })
 }
 
 function wrapFields (fields, tracer, config) {
@@ -41,12 +81,30 @@ function wrapFields (fields, tracer, config) {
 
 function wrapResolve (resolve, tracer, config) {
   return function resolveWithTrace (source, args, contextValue, info) {
+    const path = getPath(info.path)
+    const resolverContext = {
+      'path': path,
+      'parentType': info.parentType,
+      'fieldName': info.fieldName,
+      'returnType': info.returnType,
+      'startTime': platform.now()
+    }
+    // console.log(info)
+
     let result
 
-    tracer.trace('graphql.query', span => {
+    if (!info.path.prev) {
+      contextValue._datadog_spans[path] = {
+        span: createQuerySpan(tracer, config)
+      }
+    }
+
+    tracer.trace('graphql.resolve', {
+      childOf: contextValue._datadog_spans[path[0]].span
+    }, span => {
       span.addTags({
         'service.name': config.service || (tracer._service && `${tracer._service}-graphql`) || 'graphql',
-        'resource.name': getResource(info.path).join('.')
+        'resource.name': path.join('.')
       })
 
       try {
@@ -55,19 +113,50 @@ function wrapResolve (resolve, tracer, config) {
         if (result && typeof result.then === 'function') {
           result = result
             .then(value => {
+            // finish(resolverContext, contextValue)
               span.finish()
+              contextValue._datadog_spans[path[0]].finishTime = platform.now()
               return value
             })
-            .catch(err => finishAndThrow(span, err))
+            .catch(err => {
+            // finish(resolverContext, contextValue, err)
+              contextValue._datadog_spans[path[0]].finishTime = platform.now()
+              finishAndThrow(span, err)
+            })
         } else {
+        // finish(resolverContext, contextValue)
+          contextValue._datadog_spans[path[0]].finishTime = platform.now()
           span.finish()
         }
       } catch (e) {
+      // finish(resolverContext, contextValue, e)
+        contextValue._datadog_spans[path[0]].finishTime = platform.now()
         finishAndThrow(span, e)
       }
     })
 
     return result
+  }
+}
+
+function createQuerySpan (tracer, config) {
+  let span
+
+  tracer.trace('graphql.query', parent => {
+    span = parent
+  })
+
+  return span
+}
+
+function finish (resolverContext, contextValue, error) {
+  resolverContext.duration = platform.now() - resolverContext.startTime
+  resolverContext.error = error
+
+  contextValue._datadog_resolvers.push(resolverContext)
+
+  if (error) {
+    throw error
   }
 }
 
@@ -87,8 +176,12 @@ function normalizeArgs (args) {
   }
 }
 
-function getSelections (selectionSet) {
-  // path -> span
+function getPath (path) {
+  if (path.prev) {
+    return getResource(path.prev).concat(path.key)
+  } else {
+    return [path.key]
+  }
 }
 
 function getResource (path) {
@@ -122,11 +215,9 @@ module.exports = {
   file: 'execution/execute.js',
   versions: ['>=0.13.0 <1.0.0'],
   patch (execute, tracer, config) {
-    defaultFieldResolver = execute.defaultFieldResolver
-    shimmer.wrap(execute, 'execute', createWrapExecute(tracer, config))
+    shimmer.wrap(execute, 'execute', createWrapExecute(tracer, config, execute.defaultFieldResolver))
   },
   unpatch (execute) {
     shimmer.unwrap(execute, 'execute')
-    defaultFieldResolver = null
   }
 }

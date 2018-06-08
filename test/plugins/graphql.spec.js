@@ -8,7 +8,7 @@ describe('Plugin', () => {
   let graphql
   let schema
 
-  describe('express', () => {
+  describe('graphql', () => {
     beforeEach(() => {
       plugin = require('../../src/plugins/graphql')
       graphql = require('graphql')
@@ -42,7 +42,7 @@ describe('Plugin', () => {
                 }
               }),
               resolve (obj, args) {
-                return 'test'
+                return 'test' // Promise.resolve('test')
               }
             }
           }
